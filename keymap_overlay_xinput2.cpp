@@ -1,12 +1,12 @@
 #include <X11/XKBlib.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/extensions/XInput2.h>
+#include <X11/keysym.h>
 #include <cairo/cairo-xlib.h>
 #include <cairo/cairo.h>
 #include <ctime>
-#include <fcntl.h>
 #include <iostream>
-#include <libevdev/libevdev.h>
 #include <librsvg/rsvg.h>
 #include <unistd.h>
 
@@ -22,6 +22,7 @@ XVisualInfo vinfo;
 enum class SvgRegion { TOP, MID_TOP, MID_BOTTOM, BOTTOM, FULL };
 
 Window create_overlay_window(int x, int y) {
+
   XMatchVisualInfo(display, DefaultScreen(display), 32, TrueColor, &vinfo);
   XSetWindowAttributes attrs;
   attrs.colormap = XCreateColormap(display, root, vinfo.visual, AllocNone);
@@ -116,56 +117,76 @@ int main() {
   screen = DefaultScreen(display);
   root = DefaultRootWindow(display);
 
-  const char *device_path =
-      "/dev/input/event10"; // Update to your keyboard device
-
-  int fd = open(device_path, O_RDONLY | O_NONBLOCK);
-  if (fd < 0) {
-    std::cerr << "Failed to open input device: " << device_path << "\n";
+  int xi_opcode, event, error;
+  if (!XQueryExtension(display, "XInputExtension", &xi_opcode, &event,
+                       &error)) {
+    std::cerr << "X Input extension not available.\n";
     return 1;
   }
 
-  struct libevdev *dev = nullptr;
-  if (libevdev_new_from_fd(fd, &dev) < 0) {
-    std::cerr << "Failed to init libevdev\n";
-    return 1;
-  }
+  XIEventMask evmask;
+  unsigned char mask[(XI_LASTEVENT + 7) / 8] = {0};
+  evmask.deviceid = XIAllMasterDevices;
+  evmask.mask_len = sizeof(mask);
+  evmask.mask = mask;
+  XISetMask(mask, XI_RawKeyPress);
 
-  std::cout << "Monitoring " << libevdev_get_name(dev) << "\n";
+  XISelectEvents(display, root, &evmask, 1);
+  XFlush(display);
 
-  struct input_event ev;
-  bool ctrl_down = false; // Track CTRL state
+  std::cout << "Listening for keypresses...\n";
 
   while (true) {
-    int rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-    if (rc == 0 && ev.type == EV_KEY) {
-      if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
-        ctrl_down = (ev.value != 0); // 1 = press, 0 = release
+    XEvent ev;
+    XNextEvent(display, &ev);
+
+    if (ev.xcookie.type == GenericEvent && ev.xcookie.extension == xi_opcode &&
+        XGetEventData(display, &ev.xcookie)) {
+
+      XIRawEvent *re = reinterpret_cast<XIRawEvent *>(ev.xcookie.data);
+      int keycode = re->detail;
+
+      KeySym ks = XkbKeycodeToKeysym(display, keycode, 0, 0);
+      if (ks == NoSymbol) {
+        XFreeEventData(display, &ev.xcookie);
+        continue;
       }
 
-      if (ev.value == 1) { // Key press
-        SvgRegion region;
-        bool show = true;
-
-        switch (ev.code) {
-        case KEY_HELP:
-          if (ctrl_down)
-            region = SvgRegion::MID_BOTTOM;
-          else
-            region = SvgRegion::MID_TOP;
-          break;
-        default:
-          // std::cout << "Pressed code: " << ev.code << std::endl;
-          show = false;
-          break;
-        }
-
-        if (show) {
-          show_overlay(region);
-        }
+      SvgRegion region;
+      bool show = true;
+      switch (ks) {
+      case XK_Help:
+        region = SvgRegion::MID_TOP;
+        break;
+      // case XK_c:
+      //   region = SvgRegion::TOP;
+      //   break;
+      // case XK_v:
+      //   region = SvgRegion::MID_TOP;
+      //   break;
+      // case XK_b:
+      //   region = SvgRegion::MID_BOTTOM;
+      //   break;
+      // case XK_n:
+      //   region = SvgRegion::BOTTOM;
+      //   break;
+      // case XK_A:
+      //   region = SvgRegion::FULL;
+      //   break;
+      default:
+        std::cout << "Pressed " << ks << std::endl;
+        show = false;
+        break;
       }
+
+      if (show) {
+        show_overlay(region);
+      }
+
+      XFreeEventData(display, &ev.xcookie);
     }
-
-    usleep(5000);
   }
+
+  XCloseDisplay(display);
+  return 0;
 }
